@@ -1,0 +1,29 @@
+# Фикстуры — это реальные страницы RuTracker, снятые скриптом dump_fixtures.py.
+# Любая косметическая правка в них меняет тестовые данные, поэтому они исключены
+# из хуков, трогающих содержимое файлов.
+exclude: '^tests/fixtures/'
+
+repos:
+  # Базовые проверки файлов
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      # Утечка учётных данных уже была близка: .env.example лежал с реальными
+      # логином и паролем. Проверяем, что приватные ключи не уезжают в историю.
+      - id: detect-private-key
+
+  # Линтер + автоисправления. rev держим равным версии ruff из dev-группы,
+  # иначе хук и `uv run ruff format` форматируют по-разному.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+
+      - id: ruff-format

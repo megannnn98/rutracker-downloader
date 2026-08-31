@@ -1,0 +1,39 @@
+[project]
+name = "rutracker-downloader"
+version = "0.1.0"
+description = "CLI downloader for RuTracker .torrent files"
+readme = "README.md"
+authors = [
+    { name = "m.karatanov", email = "karatanov.mn@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.3",
+    "selectolax>=0.4.11",
+]
+
+[project.scripts]
+torrent-loader = "rutracker_downloader:main"
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src", "tests"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.5",
+]

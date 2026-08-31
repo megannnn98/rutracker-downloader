@@ -1,0 +1,9 @@
+.env
+cookies.txt
+torrents/
+.venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+output/
