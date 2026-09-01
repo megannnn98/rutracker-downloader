@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
 from pathlib import Path
 
-from rutracker_downloader.client import RutrackerClient
-from rutracker_downloader.config import load_settings
-from rutracker_downloader.downloader import DEFAULT_MAX_PAGES, Downloader, Stats
+from rutracker_downloader.client import DEFAULT_DELAY, RutrackerClient
+from rutracker_downloader.config import Settings, load_settings
+from rutracker_downloader.downloader import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_MAX_PAGES,
+    Downloader,
+    Stats,
+)
 from rutracker_downloader.errors import (
     CloudflareChallenge,
     ConfigError,
@@ -23,8 +29,6 @@ EXIT_CONFIG = 1
 EXIT_NETWORK = 2
 EXIT_PARTIAL = 3
 EXIT_IO = 4
-
-DEFAULT_DELAY = 1.0
 
 
 def non_negative_float(raw: str) -> float:
@@ -69,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="предел страниц выдачи",
     )
     parser.add_argument(
+        "--concurrency",
+        type=positive_int,
+        default=DEFAULT_CONCURRENCY,
+        help="параллельных скачиваний",
+    )
+    parser.add_argument(
         "--include-unknown",
         action="store_true",
         help="качать и раздачи без книжных и аудио-маркеров",
@@ -88,7 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
 def setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="%(levelname)s %(message)s",
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
         stream=sys.stderr,
     )
 
@@ -102,6 +113,31 @@ def print_report(stats: Stats, *, include_unknown: bool) -> None:
         print("Чтобы скачать и их, повторите запуск с --include-unknown.")
 
 
+async def _run(settings: Settings, args: argparse.Namespace, stats: Stats) -> int:
+    async with RutrackerClient(settings, delay=args.delay) as client:
+        if args.login:
+            if not settings.username or not settings.password:
+                print(
+                    "для --login задайте RUTRACKER_USERNAME и RUTRACKER_PASSWORD",
+                    file=sys.stderr,
+                )
+                return EXIT_CONFIG
+            await client.login(settings.username, settings.password)
+
+        downloader = Downloader(
+            client,
+            args.output,
+            include_unknown=args.include_unknown,
+            dry_run=args.dry_run,
+            max_pages=args.max_pages,
+            concurrency=args.concurrency,
+            stats=stats,
+        )
+        await downloader.run(args.query)
+
+    return EXIT_PARTIAL if stats.errors else EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose)
@@ -112,45 +148,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ошибка конфигурации: {exc}", file=sys.stderr)
         return EXIT_CONFIG
 
+    include_unknown = args.include_unknown
     stats = Stats()
-    try:
-        with RutrackerClient(settings, delay=args.delay) as client:
-            if args.login:
-                if not settings.username or not settings.password:
-                    print(
-                        "для --login задайте RUTRACKER_USERNAME и RUTRACKER_PASSWORD",
-                        file=sys.stderr,
-                    )
-                    return EXIT_CONFIG
-                client.login(settings.username, settings.password)
 
-            downloader = Downloader(
-                client,
-                args.output,
-                include_unknown=args.include_unknown,
-                dry_run=args.dry_run,
-                max_pages=args.max_pages,
-            )
-            stats = downloader.stats
-            downloader.run(args.query)
+    try:
+        exit_code = asyncio.run(_run(settings, args, stats))
     except (ConfigError, LoginError) as exc:
         print(f"ошибка доступа: {exc}", file=sys.stderr)
-        print_report(stats, include_unknown=args.include_unknown)
+        print_report(stats, include_unknown=include_unknown)
         return EXIT_CONFIG
     except (CloudflareChallenge, SessionExpired) as exc:
         print(f"\nпрогон остановлен: {exc}", file=sys.stderr)
-        print_report(stats, include_unknown=args.include_unknown)
+        print_report(stats, include_unknown=include_unknown)
         return EXIT_NETWORK
     except RutrackerError as exc:
         print(f"\nсетевая ошибка: {exc}", file=sys.stderr)
-        print_report(stats, include_unknown=args.include_unknown)
+        print_report(stats, include_unknown=include_unknown)
         return EXIT_NETWORK
     except OSError as exc:
-        # mkdir, запись временного файла, os.link: без этого был бы traceback
-        # вместо отчёта, и статистика частичного прогона терялась бы.
         print(f"\nошибка файловой системы: {exc}", file=sys.stderr)
-        print_report(stats, include_unknown=args.include_unknown)
+        print_report(stats, include_unknown=include_unknown)
         return EXIT_IO
 
-    print_report(stats, include_unknown=args.include_unknown)
-    return EXIT_PARTIAL if stats.errors else EXIT_OK
+    print_report(stats, include_unknown=include_unknown)
+    return exit_code

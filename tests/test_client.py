@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -53,7 +54,7 @@ def settings(tmp_path: Path) -> Settings:
 def make_client(settings: Settings, handler: object) -> RutrackerClient:
     transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
     return RutrackerClient(
-        settings, delay=0.0, client=httpx.Client(transport=transport)
+        settings, delay=0.0, client=httpx.AsyncClient(transport=transport)
     )
 
 
@@ -77,7 +78,7 @@ def test_success_is_not_a_challenge() -> None:
     assert is_challenge(httpx.Response(200, text=RESULTS_HTML)) is False
 
 
-def test_challenge_is_not_retried(settings: Settings) -> None:
+async def test_challenge_is_not_retried(settings: Settings) -> None:
     """Ретраить challenge бессмысленно: нужен свежий cf_clearance из браузера."""
     calls = 0
 
@@ -88,32 +89,39 @@ def test_challenge_is_not_retried(settings: Settings) -> None:
             403, headers={"cf-mitigated": "challenge"}, text=CHALLENGE_HTML
         )
 
-    with make_client(settings, handler) as client, pytest.raises(CloudflareChallenge):
-        client.fetch_page("https://rutracker.net/forum/tracker.php")
+    async with make_client(settings, handler) as client:
+        with pytest.raises(CloudflareChallenge):
+            await client.fetch_page("https://rutracker.net/forum/tracker.php")
 
     assert calls == 1
 
 
-def test_guest_page_means_expired_session(settings: Settings) -> None:
+async def test_guest_page_means_expired_session(settings: Settings) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=GUEST_HTML.encode("cp1251"))
 
-    with make_client(settings, handler) as client, pytest.raises(SessionExpired):
-        client.fetch_page("https://rutracker.net/forum/tracker.php")
+    async with make_client(settings, handler) as client:
+        with pytest.raises(SessionExpired):
+            await client.fetch_page("https://rutracker.net/forum/tracker.php")
 
 
-def test_results_page_passes(settings: Settings) -> None:
+async def test_results_page_passes(settings: Settings) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=RESULTS_HTML.encode("cp1251"))
 
-    with make_client(settings, handler) as client:
-        assert "tor-tbl" in client.fetch_page("https://rutracker.net/forum/tracker.php")
+    async with make_client(settings, handler) as client:
+        assert "tor-tbl" in await client.fetch_page(
+            "https://rutracker.net/forum/tracker.php"
+        )
 
 
-def test_rate_limit_is_retried(
+async def test_rate_limit_is_retried(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("rutracker_downloader.client.time.sleep", lambda _: None)
+    async def _no_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
     responses = [
         httpx.Response(429, headers={"retry-after": "1"}, text="slow down"),
         httpx.Response(200, content=RESULTS_HTML.encode("cp1251")),
@@ -122,23 +130,29 @@ def test_rate_limit_is_retried(
     def handler(request: httpx.Request) -> httpx.Response:
         return responses.pop(0)
 
-    with make_client(settings, handler) as client:
-        assert "tor-tbl" in client.fetch_page("https://rutracker.net/forum/tracker.php")
+    async with make_client(settings, handler) as client:
+        assert "tor-tbl" in await client.fetch_page(
+            "https://rutracker.net/forum/tracker.php"
+        )
 
 
-def test_persistent_server_error_raises(
+async def test_persistent_server_error_raises(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("rutracker_downloader.client.time.sleep", lambda _: None)
+    async def _no_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="maintenance")
 
-    with make_client(settings, handler) as client, pytest.raises(HttpError):
-        client.fetch_page("https://rutracker.net/forum/tracker.php")
+    async with make_client(settings, handler) as client:
+        with pytest.raises(HttpError):
+            await client.fetch_page("https://rutracker.net/forum/tracker.php")
 
 
-def test_torrent_is_returned_with_referer(settings: Settings) -> None:
+async def test_torrent_is_returned_with_referer(settings: Settings) -> None:
     seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -149,13 +163,13 @@ def test_torrent_is_returned_with_referer(settings: Settings) -> None:
             content=TORRENT_BYTES,
         )
 
-    with make_client(settings, handler) as client:
-        assert client.download_torrent(42) == TORRENT_BYTES
+    async with make_client(settings, handler) as client:
+        assert await client.download_torrent(42) == TORRENT_BYTES
 
     assert seen["referer"] == "https://rutracker.net/forum/viewtopic.php?t=42"
 
 
-def test_html_instead_of_torrent_is_rejected(settings: Settings) -> None:
+async def test_html_instead_of_torrent_is_rejected(settings: Settings) -> None:
     """dl.php при протухшей сессии отдаёт HTML со статусом 200."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -165,18 +179,20 @@ def test_html_instead_of_torrent_is_rejected(settings: Settings) -> None:
             content=GUEST_HTML.encode("cp1251"),
         )
 
-    with make_client(settings, handler) as client, pytest.raises(SessionExpired):
-        client.download_torrent(42)
+    async with make_client(settings, handler) as client:
+        with pytest.raises(SessionExpired):
+            await client.download_torrent(42)
 
 
-def test_non_torrent_payload_is_rejected(settings: Settings) -> None:
+async def test_non_torrent_payload_is_rejected(settings: Settings) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, headers={"content-type": "text/html"}, content=b"<html>oops"
         )
 
-    with make_client(settings, handler) as client, pytest.raises(TorrentUnavailable):
-        client.download_torrent(42)
+    async with make_client(settings, handler) as client:
+        with pytest.raises(TorrentUnavailable):
+            await client.download_torrent(42)
 
 
 def test_query_is_encoded_in_cp1251() -> None:
@@ -231,28 +247,36 @@ def test_retry_after_garbage_is_ignored() -> None:
     assert parse_retry_after("завтра") is None
 
 
-def test_retry_after_header_is_honoured(
+async def test_retry_after_header_is_honoured(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Пауза берётся из заголовка, а не из экспоненциального backoff."""
     slept: list[float] = []
-    monkeypatch.setattr("rutracker_downloader.client.time.sleep", slept.append)
+
+    async def _track_sleep(duration: float) -> None:
+        slept.append(duration)
+
+    monkeypatch.setattr("asyncio.sleep", _track_sleep)
     responses = [
         httpx.Response(429, headers={"retry-after": "9"}, text="slow down"),
         httpx.Response(200, content=RESULTS_HTML.encode("cp1251")),
     ]
 
-    with make_client(settings, lambda request: responses.pop(0)) as client:
-        client.fetch_page("https://rutracker.net/forum/tracker.php")
+    async with make_client(settings, lambda request: responses.pop(0)) as client:
+        await client.fetch_page("https://rutracker.net/forum/tracker.php")
 
     assert 9.0 in slept
 
 
-def test_retry_attempts_are_limited(
+async def test_retry_attempts_are_limited(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Ровно MAX_RETRIES попыток: без счётчика тест прошёл бы и при отсутствии ретраев."""
-    monkeypatch.setattr("rutracker_downloader.client.time.sleep", lambda _: None)
+
+    async def _no_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -260,8 +284,9 @@ def test_retry_attempts_are_limited(
         calls += 1
         return httpx.Response(503, text="maintenance")
 
-    with make_client(settings, handler) as client, pytest.raises(HttpError):
-        client.fetch_page("https://rutracker.net/forum/tracker.php")
+    async with make_client(settings, handler) as client:
+        with pytest.raises(HttpError):
+            await client.fetch_page("https://rutracker.net/forum/tracker.php")
 
     assert calls == MAX_RETRIES
 
@@ -269,7 +294,7 @@ def test_retry_attempts_are_limited(
 # --- валидация .torrent ----------------------------------------------------
 
 
-def test_content_type_with_parameters_is_accepted(settings: Settings) -> None:
+async def test_content_type_with_parameters_is_accepted(settings: Settings) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -277,11 +302,11 @@ def test_content_type_with_parameters_is_accepted(settings: Settings) -> None:
             content=TORRENT_BYTES,
         )
 
-    with make_client(settings, handler) as client:
-        assert client.download_torrent(42) == TORRENT_BYTES
+    async with make_client(settings, handler) as client:
+        assert await client.download_torrent(42) == TORRENT_BYTES
 
 
-def test_bencode_garbage_is_rejected(settings: Settings) -> None:
+async def test_bencode_garbage_is_rejected(settings: Settings) -> None:
     """Первого байта `d` мало: под него подходит любой мусор."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -291,11 +316,12 @@ def test_bencode_garbage_is_rejected(settings: Settings) -> None:
             content=b"dnot-a-torrent",
         )
 
-    with make_client(settings, handler) as client, pytest.raises(TorrentUnavailable):
-        client.download_torrent(42)
+    async with make_client(settings, handler) as client:
+        with pytest.raises(TorrentUnavailable):
+            await client.download_torrent(42)
 
 
-def test_truncated_torrent_is_rejected(settings: Settings) -> None:
+async def test_truncated_torrent_is_rejected(settings: Settings) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -303,18 +329,20 @@ def test_truncated_torrent_is_rejected(settings: Settings) -> None:
             content=b"d8:announce30:http://bt.rutracker.org/annce",
         )
 
-    with make_client(settings, handler) as client, pytest.raises(TorrentUnavailable):
-        client.download_torrent(42)
+    async with make_client(settings, handler) as client:
+        with pytest.raises(TorrentUnavailable):
+            await client.download_torrent(42)
 
 
-def test_torrent_body_under_text_html_is_rejected(settings: Settings) -> None:
+async def test_torrent_body_under_text_html_is_rejected(settings: Settings) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, headers={"content-type": "text/html"}, content=TORRENT_BYTES
         )
 
-    with make_client(settings, handler) as client, pytest.raises(TorrentUnavailable):
-        client.download_torrent(42)
+    async with make_client(settings, handler) as client:
+        with pytest.raises(TorrentUnavailable):
+            await client.download_torrent(42)
 
 
 def test_is_torrent_payload() -> None:
@@ -387,3 +415,30 @@ def test_corrupt_cookie_file_raises_config_error(
 
     with pytest.raises(ConfigError):
         load_cookie_jar(broken)
+
+
+# --- throttle serialization ------------------------------------------------
+
+
+async def test_throttle_serializes_concurrent_requests(settings: Settings) -> None:
+    """Без Lock три запроса спят параллельно и укладываются в один интервал."""
+    import time
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=RESULTS_HTML.encode("cp1251"))
+
+    async with RutrackerClient(
+        settings,
+        delay=0.05,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        started = time.monotonic()
+        await asyncio.gather(
+            *(
+                client.fetch_page("https://rutracker.net/forum/tracker.php")
+                for _ in range(3)
+            )
+        )
+        elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.08

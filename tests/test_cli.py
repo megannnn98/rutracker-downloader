@@ -27,10 +27,10 @@ SETTINGS = Settings(
 
 
 class StubClient:
-    def __enter__(self) -> Self:
+    async def __aenter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         return None
 
 
@@ -47,11 +47,12 @@ def install_stubs(
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.stats = prepared
 
-        def run(self, query: str) -> Stats:
+        async def run(self, query: str) -> Stats:
             if run_effect is not None:
                 raise run_effect
             return self.stats
 
+    monkeypatch.setattr("rutracker_downloader.cli.Stats", lambda: prepared)
     monkeypatch.setattr(
         "rutracker_downloader.cli.load_settings", lambda **kwargs: SETTINGS
     )
@@ -77,6 +78,14 @@ def test_zero_delay_is_allowed() -> None:
     from rutracker_downloader.cli import build_parser
 
     assert build_parser().parse_args(["--query", "лем", "--delay", "0"]).delay == 0.0
+
+
+def test_default_delay_and_concurrency() -> None:
+    from rutracker_downloader.cli import build_parser
+
+    args = build_parser().parse_args(["--query", "лем"])
+    assert args.delay == 0.01
+    assert args.concurrency == 20
 
 
 def test_successful_run_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -112,6 +121,27 @@ def test_config_error_gives_config_code(monkeypatch: pytest.MonkeyPatch) -> None
         raise ConfigError("не задан RUTRACKER_USER_AGENT")
 
     monkeypatch.setattr("rutracker_downloader.cli.load_settings", raising)
+
+    assert main(["--query", "лем"]) == EXIT_CONFIG
+
+
+def test_config_error_from_client_gives_config_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ConfigError из RutrackerClient.__init__ (load_cookie_jar) → EXIT_CONFIG."""
+
+    class RaisingClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ConfigError("не найден файл cookies")
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    install_stubs(monkeypatch, stats=Stats(found=3, downloaded=3))
+    monkeypatch.setattr("rutracker_downloader.cli.RutrackerClient", RaisingClient)
 
     assert main(["--query", "лем"]) == EXIT_CONFIG
 

@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from rutracker_downloader.errors import HttpError, TorrentUnavailable
+from rutracker_downloader.errors import HttpError, RutrackerError, TorrentUnavailable
 from rutracker_downloader.filters import Verdict, classify, should_download
 from rutracker_downloader.models import TorrentEntry
 from rutracker_downloader.naming import torrent_filename
@@ -19,6 +20,7 @@ from rutracker_downloader.parser import parse_search_page
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_PAGES = 50
+DEFAULT_CONCURRENCY = 20
 
 
 class SearchClient(Protocol):
@@ -30,9 +32,9 @@ class SearchClient(Protocol):
 
     def search_url(self, query: str, start: int = 0) -> str: ...
 
-    def fetch_page(self, url: str) -> str: ...
+    def fetch_page(self, url: str) -> Awaitable[str]: ...
 
-    def download_torrent(self, topic_id: int) -> bytes: ...
+    def download_torrent(self, topic_id: int) -> Awaitable[bytes]: ...
 
 
 @dataclass(slots=True)
@@ -77,49 +79,77 @@ class Downloader:
         include_unknown: bool = False,
         dry_run: bool = False,
         max_pages: int = DEFAULT_MAX_PAGES,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        stats: Stats | None = None,
     ) -> None:
         self._client = client
         self._output_dir = output_dir
         self._include_unknown = include_unknown
         self._dry_run = dry_run
         self._max_pages = max_pages
-        self.stats = Stats()
+        self.stats = stats if stats is not None else Stats()
+        self._semaphore = asyncio.Semaphore(concurrency)
 
-    def iter_entries(self, query: str) -> Iterator[TorrentEntry]:
-        """Обойти страницы выдачи, отдавая уникальные раздачи."""
+    async def _crawl(self, query: str, sink: list[TorrentEntry]) -> None:
+        """Обойти страницы выдачи BFS-уровнями, параллельно в пределах уровня.
+
+        Раздачи накапливаются в sink — уже разобранные страницы не теряются
+        при исключении на более поздней странице.
+        """
         pending = [self._client.search_url(query)]
         visited: set[str] = set()
-        seen_topics: set[int] = set()
+        crawl_error: BaseException | None = None
 
         while pending and self.stats.pages < self._max_pages:
-            url = pending.pop(0)
-            if url in visited:
-                continue
-            visited.add(url)
+            level = pending[: self._max_pages - self.stats.pages]
+            pending = []
+            visited.update(level)
 
-            html = self._client.fetch_page(url)
-            page = parse_search_page(html, url)
-            self.stats.pages += 1
-            logger.debug("страница %s: раздач %d", url, len(page.entries))
+            async def _fetch(url: str) -> tuple[str, str]:
+                async with self._semaphore:
+                    html = await self._client.fetch_page(url)
+                return url, html
 
-            for candidate in page.pagination_urls:
-                if candidate not in visited and candidate not in pending:
-                    pending.append(candidate)
+            results = await asyncio.gather(
+                *(_fetch(url) for url in level), return_exceptions=True
+            )
 
-            for entry in page.entries:
-                self.stats.found += 1
-                if entry.topic_id in seen_topics:
-                    self.stats.duplicates += 1
+            first_error: BaseException | None = None
+            for page_url, result in zip(level, results, strict=True):
+                if isinstance(result, BaseException):
+                    if first_error is None:
+                        first_error = result
+                    else:
+                        logger.warning(
+                            "обход %s: %s", page_url, result, exc_info=result
+                        )
                     continue
-                seen_topics.add(entry.topic_id)
-                yield entry
+                url, html = result
+                self.stats.pages += 1
 
-        if pending:
+                page = parse_search_page(html, url)
+                logger.debug("страница %s: раздач %d", url, len(page.entries))
+
+                for candidate in page.pagination_urls:
+                    if candidate not in visited:
+                        visited.add(candidate)
+                        pending.append(candidate)
+
+                sink.extend(page.entries)
+
+            if first_error is not None:
+                crawl_error = first_error
+                break
+
+        if pending and crawl_error is None:
             logger.warning(
                 "достигнут лимит --max-pages=%d, осталось необойдённых страниц: %d",
                 self._max_pages,
                 len(pending),
             )
+
+        if crawl_error is not None:
+            raise crawl_error
 
     def _save(self, entry: TorrentEntry, payload: bytes) -> bool:
         """Создать файл атомарно, не перезаписывая существующий.
@@ -148,7 +178,7 @@ class Downloader:
         logger.info("скачано: %s", target.name)
         return True
 
-    def _handle(self, entry: TorrentEntry) -> None:
+    async def _handle(self, entry: TorrentEntry) -> None:
         target = self._output_dir / torrent_filename(entry.topic_id, entry.title)
         if target.exists() and target.stat().st_size > 0:
             self.stats.already_exists += 1
@@ -169,7 +199,7 @@ class Downloader:
             return
 
         try:
-            payload = self._client.download_torrent(entry.topic_id)
+            payload = await self._client.download_torrent(entry.topic_id)
         except (TorrentUnavailable, HttpError) as exc:
             self.stats.errors += 1
             logger.error("не скачано %s: %s", entry.topic_id, exc)
@@ -180,14 +210,30 @@ class Downloader:
         else:
             self.stats.already_exists += 1
 
-    def run(self, query: str) -> Stats:
+    async def run(self, query: str) -> Stats:
         """Выполнить прогон. Ошибки уровня сессии пробрасываются наружу."""
         if not self._dry_run:
             self._output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Сессионные ошибки (challenge, протухший bb_session) намеренно не ловятся:
-        # прогон обрывается, а накопленную статистику печатает CLI.
-        for entry in self.iter_entries(query):
+        all_entries: list[TorrentEntry] = []
+        crawl_error: RutrackerError | None = None
+        try:
+            await self._crawl(query, all_entries)
+        except RutrackerError as exc:
+            crawl_error = exc
+
+        seen: set[int] = set()
+        unique: list[TorrentEntry] = []
+        for entry in all_entries:
+            self.stats.found += 1
+            if entry.topic_id in seen:
+                self.stats.duplicates += 1
+                continue
+            seen.add(entry.topic_id)
+            unique.append(entry)
+
+        to_download: list[TorrentEntry] = []
+        for entry in unique:
             verdict = classify(entry.title, entry.forum)
 
             if verdict.verdict is Verdict.AUDIO:
@@ -202,6 +248,26 @@ class Downloader:
                 self.stats.unknown_skipped += 1
                 continue
 
-            self._handle(entry)
+            to_download.append(entry)
+
+        async def _guarded(entry: TorrentEntry) -> None:
+            async with self._semaphore:
+                await self._handle(entry)
+
+        results = await asyncio.gather(
+            *(_guarded(e) for e in to_download), return_exceptions=True
+        )
+        download_error: BaseException | None = None
+        for result in results:
+            if isinstance(result, BaseException):
+                if download_error is None:
+                    download_error = result
+                else:
+                    logger.warning("скачивание: %s", result, exc_info=result)
+
+        if crawl_error is not None:
+            raise crawl_error
+        if download_error is not None:
+            raise download_error
 
         return self.stats

@@ -9,6 +9,7 @@ Cloudflare Managed Challenge (проверено: 403 + заголовок
 
 from __future__ import annotations
 
+import asyncio
 import http.cookiejar
 import logging
 import random
@@ -45,6 +46,7 @@ TORRENT_CONTENT_TYPES: Final = frozenset(
     {"application/x-bittorrent", "application/octet-stream"}
 )
 MAX_RETRY_AFTER: Final = 60.0
+DEFAULT_DELAY: Final = 0.01  # суммарная частота = 1/delay; при 1.0 параллелизм не работал, при 0.01 ограничитель — --concurrency
 
 CHALLENGE_HELP: Final = (
     "Cloudflare вернул JS-challenge. Обновите cookies: откройте rutracker в том же "
@@ -163,13 +165,13 @@ class RutrackerClient:
         self,
         settings: Settings,
         *,
-        delay: float = 1.0,
-        client: httpx.Client | None = None,
+        delay: float = DEFAULT_DELAY,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         self._settings = settings
         self._delay = delay
         self._jar = load_cookie_jar(settings.cookies_file) if client is None else None
-        self._client = client or httpx.Client(
+        self._client = client or httpx.AsyncClient(
             cookies=self._jar,
             follow_redirects=True,
             http2=False,
@@ -183,22 +185,25 @@ class RutrackerClient:
         )
         self._owns_client = client is None
         self._last_request_at: float | None = None
+        self._rate_limit_lock = asyncio.Lock()
 
-    def __enter__(self) -> Self:
+    async def __aenter__(self) -> Self:
         return self
 
-    def __exit__(
+    async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.close()
+        await self.close()
 
-    def close(self) -> None:
-        if self._owns_client:
-            self._client.close()
-        self._persist_cookies()
+    async def close(self) -> None:
+        try:
+            if self._owns_client:
+                await self._client.aclose()
+        finally:
+            self._persist_cookies()
 
     def _persist_cookies(self) -> None:
         """Сохранить рабочий jar в кэш, не трогая файл пользователя."""
@@ -212,13 +217,31 @@ class RutrackerClient:
         except OSError as exc:  # не повод ронять прогон
             logger.warning("не удалось сохранить cookies в %s: %s", target, exc)
 
-    def _throttle(self) -> None:
-        if self._last_request_at is None:
-            return
-        jitter = self._delay * random.uniform(0.8, 1.2)
-        elapsed = time.monotonic() - self._last_request_at
-        if elapsed < jitter:
-            time.sleep(jitter - elapsed)
+    async def _throttle(self) -> None:
+        """Сериализует запросы: интервал start-to-start.
+
+        При одинаковом --delay нагрузка на сайт выросла по сравнению с
+        синхронной версией (response-to-start): запросы стартуют чаще,
+        но не чаще delay между стартами.
+        """
+        async with self._rate_limit_lock:
+            if self._last_request_at is None:
+                self._last_request_at = time.monotonic()
+                return
+            jitter = self._delay * random.uniform(0.8, 1.2)
+            elapsed = time.monotonic() - self._last_request_at
+            if elapsed < jitter:
+                await asyncio.sleep(jitter - elapsed)
+            self._last_request_at = time.monotonic()
+
+    async def _backoff(self, pause: float) -> None:
+        """Спать pause секунд под rate-limit lock.
+
+        429/Retry-After тормозит весь клиент, а не одну корутину.
+        """
+        async with self._rate_limit_lock:
+            await asyncio.sleep(pause)
+            self._last_request_at = time.monotonic()
 
     def _retry_delay(self, response: httpx.Response, attempt: int) -> float:
         """Пауза перед повтором: Retry-After, иначе экспоненциальный backoff."""
@@ -229,20 +252,18 @@ class RutrackerClient:
                 return seconds
         return float(2**attempt)
 
-    def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
         """Выполнить запрос с задержкой, ретраями и детектом challenge."""
         last: httpx.Response | None = None
         for attempt in range(MAX_RETRIES):
-            self._throttle()
+            await self._throttle()
             try:
-                response = self._client.request(method, url, **kwargs)  # type: ignore[arg-type]
+                response = await self._client.request(method, url, **kwargs)  # type: ignore[arg-type]
             except httpx.HTTPError as exc:
                 if attempt == MAX_RETRIES - 1:
                     raise HttpError(f"{method} {url}: {exc}") from exc
-                time.sleep(float(2**attempt))
+                await self._backoff(float(2**attempt))
                 continue
-            finally:
-                self._last_request_at = time.monotonic()
 
             # Challenge не ретраим: свежий cf_clearance берётся только из браузера.
             if is_challenge(response):
@@ -257,7 +278,7 @@ class RutrackerClient:
                     response.status_code,
                     pause,
                 )
-                time.sleep(pause)
+                await self._backoff(pause)
                 last = response
                 continue
 
@@ -278,9 +299,9 @@ class RutrackerClient:
         params = {"nm": query} if start == 0 else {"nm": query, "start": str(start)}
         return f"{self._settings.search_url}?{encode_query(params)}"
 
-    def fetch_page(self, url: str) -> str:
+    async def fetch_page(self, url: str) -> str:
         """Скачать страницу форума и убедиться, что мы не гость."""
-        html = decode(self.request("GET", url))
+        html = decode(await self.request("GET", url))
         if looks_like_guest_page(html):
             raise SessionExpired(
                 "RuTracker считает нас гостем: cookie bb_session протух. "
@@ -288,9 +309,9 @@ class RutrackerClient:
             )
         return html
 
-    def download_torrent(self, topic_id: int) -> bytes:
+    async def download_torrent(self, topic_id: int) -> bytes:
         """Скачать .torrent и проверить, что это действительно torrent-файл."""
-        response = self.request(
+        response = await self.request(
             "GET",
             self._settings.download_url(topic_id),
             headers={"Referer": self._settings.topic_url(topic_id)},
@@ -310,13 +331,13 @@ class RutrackerClient:
             )
         return body
 
-    def login(self, username: str, password: str) -> None:
+    async def login(self, username: str, password: str) -> None:
         """Логин по паролю. Fallback на случай снятия Cloudflare-challenge."""
         body = urlencode(
             {"login_username": username, "login_password": password, "login": "вход"},
             encoding=SITE_ENCODING,
         )
-        response = self.request(
+        response = await self.request(
             "POST",
             self._settings.login_url,
             content=body.encode("ascii"),
