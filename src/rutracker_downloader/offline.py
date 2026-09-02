@@ -11,7 +11,7 @@ Cloudflare не пропускает HTTP-клиент, но браузер по
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 from typing import Final
 
@@ -134,12 +134,19 @@ def import_downloads(
     titles: Mapping[int, str],
     output_dir: Path,
     stats: Stats,
+    *,
+    allowed: Container[int] | None = None,
 ) -> None:
     """Разложить скачанные браузером .torrent по схеме именования проекта.
 
     titles берутся из разбора сохранённых страниц: в самом файле названия
     раздачи нет, а имя, под которым его сохранил браузер, обрезано. Без
     названия остаётся осмысленный запасной вариант — имя из одного topic_id.
+
+    allowed ограничивает импорт раздачами, прошедшими фильтр. Браузерный
+    сниппет качает выдачу целиком, не разбирая: отделять аудио от книг в JS
+    значило бы завести вторую копию правил, которая разойдётся с filters.py.
+    None означает «разложить всё» — режим импорта без разбора страниц.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,6 +165,12 @@ def import_downloads(
         if topic_id is None:
             stats.errors += 1
             logger.warning("в файле нет ссылки на тему, пропущен: %s", path.name)
+            continue
+
+        if allowed is not None and topic_id not in allowed:
+            # Не ошибка: раздачу отсеял фильтр, и она уже посчитана в статистике
+            # разбора страниц как аудио или неопределённая.
+            logger.debug("не прошёл фильтр, пропущен: %s", path.name)
             continue
 
         filename = torrent_filename(topic_id, titles.get(topic_id, ""))

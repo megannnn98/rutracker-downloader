@@ -233,6 +233,35 @@ def test_import_downloads_rejects_bencode_without_info_dict(tmp_path: Path) -> N
     assert list(output.iterdir()) == []
 
 
+def test_import_downloads_respects_allowed_filter(tmp_path: Path) -> None:
+    """Сниппет качает выдачу целиком, фильтр отсекает лишнее при раскладке."""
+    source = tmp_path / "downloads"
+    source.mkdir()
+    (source / "111.torrent").write_bytes(make_torrent(111))
+    (source / "222.torrent").write_bytes(make_torrent(222))
+    output = tmp_path / "out"
+    stats = Stats()
+
+    import_downloads([source], {111: "Книга"}, output, stats, allowed={111})
+
+    assert stats.downloaded == 1
+    assert stats.errors == 0
+    assert [item.name for item in output.iterdir()] == ["111_Книга.torrent"]
+
+
+def test_import_downloads_without_allowed_takes_everything(tmp_path: Path) -> None:
+    source = tmp_path / "downloads"
+    source.mkdir()
+    (source / "111.torrent").write_bytes(make_torrent(111))
+    (source / "222.torrent").write_bytes(make_torrent(222))
+    output = tmp_path / "out"
+    stats = Stats()
+
+    import_downloads([source], {}, output, stats)
+
+    assert stats.downloaded == 2
+
+
 def test_import_downloads_is_idempotent(tmp_path: Path) -> None:
     source = tmp_path / "downloads"
     source.mkdir()

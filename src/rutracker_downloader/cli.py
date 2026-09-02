@@ -185,7 +185,12 @@ def run_offline(args: argparse.Namespace) -> int:
         # Названия берём из разобранных страниц; без них имена выйдут
         # из одного topic_id, что всё равно лучше обрезанных браузерных.
         titles = {entry.topic_id: entry.title for entry in planned}
-        import_downloads(args.import_downloads, titles, args.output, stats)
+        # Браузерный сниппет качает выдачу целиком, поэтому при разборе
+        # страниц импорт ограничивается тем, что прошло фильтр.
+        allowed = set(titles) if args.from_html else None
+        import_downloads(
+            args.import_downloads, titles, args.output, stats, allowed=allowed
+        )
     elif args.dry_run:
         for entry in planned:
             print(
