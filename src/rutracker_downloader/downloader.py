@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import tempfile
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -66,6 +66,76 @@ class Stats:
                 f"ошибок                   : {self.errors}",
             ]
         )
+
+
+def save_payload(
+    output_dir: Path, filename: str, payload: bytes, *, prefix: str
+) -> bool:
+    """Создать файл атомарно, не перезаписывая существующий.
+
+    Временный файл уникален для процесса, а os.link создаёт цель только
+    если её ещё нет. Это переживает параллельные запуски в один каталог:
+    победитель ровно один, проигравший видит FileExistsError и считает
+    раздачу уже скачанной вместо того, чтобы затирать чужой результат.
+
+    Вынесено из Downloader._save ради импорта скачанных браузером файлов:
+    у него нет ни клиента, ни асинхронного прогона, но правило «не затирать
+    чужое» должно быть тем же самым.
+    """
+    target = output_dir / filename
+    handle, temporary_name = tempfile.mkstemp(
+        dir=output_dir, prefix=prefix, suffix=".part"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            logger.debug("файл уже создан параллельным запуском: %s", target.name)
+            return False
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    logger.info("сохранено: %s", target.name)
+    return True
+
+
+def select_entries(
+    entries: Sequence[TorrentEntry], stats: Stats, *, include_unknown: bool
+) -> list[TorrentEntry]:
+    """Отсеять дубликаты и аудио, попутно заполнив счётчики.
+
+    Вынесено из Downloader.run, потому что офлайн-режим (разбор сохранённых
+    страниц) обязан отбирать раздачи ровно теми же правилами: разойдись они —
+    и список ссылок перестал бы соответствовать тому, что качает сам прогон.
+    """
+    seen: set[int] = set()
+    selected: list[TorrentEntry] = []
+    for entry in entries:
+        stats.found += 1
+        if entry.topic_id in seen:
+            stats.duplicates += 1
+            continue
+        seen.add(entry.topic_id)
+
+        verdict = classify(entry.title, entry.forum)
+
+        if verdict.verdict is Verdict.AUDIO:
+            stats.audio_excluded += 1
+            logger.debug("аудио (%s): %s", verdict.marker, entry.title)
+            continue
+
+        if verdict.verdict is Verdict.UNKNOWN:
+            stats.unknown_titles.append(entry.title)
+
+        if not should_download(verdict, include_unknown=include_unknown):
+            stats.unknown_skipped += 1
+            continue
+
+        selected.append(entry)
+    return selected
 
 
 class Downloader:
@@ -152,31 +222,12 @@ class Downloader:
             raise crawl_error
 
     def _save(self, entry: TorrentEntry, payload: bytes) -> bool:
-        """Создать файл атомарно, не перезаписывая существующий.
-
-        Временный файл уникален для процесса, а os.link создаёт цель только
-        если её ещё нет. Это переживает параллельные запуски в один каталог:
-        победитель ровно один, проигравший видит FileExistsError и считает
-        раздачу уже скачанной вместо того, чтобы затирать чужой результат.
-        """
-        target = self._output_dir / torrent_filename(entry.topic_id, entry.title)
-        handle, temporary_name = tempfile.mkstemp(
-            dir=self._output_dir, prefix=f".{entry.topic_id}-", suffix=".part"
+        return save_payload(
+            self._output_dir,
+            torrent_filename(entry.topic_id, entry.title),
+            payload,
+            prefix=f".{entry.topic_id}-",
         )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(handle, "wb") as stream:
-                stream.write(payload)
-            try:
-                os.link(temporary, target)
-            except FileExistsError:
-                logger.debug("файл уже создан параллельным запуском: %s", target.name)
-                return False
-        finally:
-            temporary.unlink(missing_ok=True)
-
-        logger.info("скачано: %s", target.name)
-        return True
 
     async def _handle(self, entry: TorrentEntry) -> None:
         target = self._output_dir / torrent_filename(entry.topic_id, entry.title)
@@ -222,33 +273,9 @@ class Downloader:
         except RutrackerError as exc:
             crawl_error = exc
 
-        seen: set[int] = set()
-        unique: list[TorrentEntry] = []
-        for entry in all_entries:
-            self.stats.found += 1
-            if entry.topic_id in seen:
-                self.stats.duplicates += 1
-                continue
-            seen.add(entry.topic_id)
-            unique.append(entry)
-
-        to_download: list[TorrentEntry] = []
-        for entry in unique:
-            verdict = classify(entry.title, entry.forum)
-
-            if verdict.verdict is Verdict.AUDIO:
-                self.stats.audio_excluded += 1
-                logger.debug("аудио (%s): %s", verdict.marker, entry.title)
-                continue
-
-            if verdict.verdict is Verdict.UNKNOWN:
-                self.stats.unknown_titles.append(entry.title)
-
-            if not should_download(verdict, include_unknown=self._include_unknown):
-                self.stats.unknown_skipped += 1
-                continue
-
-            to_download.append(entry)
+        to_download = select_entries(
+            all_entries, self.stats, include_unknown=self._include_unknown
+        )
 
         async def _guarded(entry: TorrentEntry) -> None:
             async with self._semaphore:

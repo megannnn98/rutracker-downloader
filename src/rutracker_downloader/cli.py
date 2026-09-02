@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from rutracker_downloader.client import DEFAULT_DELAY, RutrackerClient
-from rutracker_downloader.config import Settings, load_settings
+from rutracker_downloader.config import DEFAULT_BASE_URL, Settings, load_settings
 from rutracker_downloader.downloader import (
     DEFAULT_CONCURRENCY,
     DEFAULT_MAX_PAGES,
@@ -22,6 +22,12 @@ from rutracker_downloader.errors import (
     LoginError,
     RutrackerError,
     SessionExpired,
+)
+from rutracker_downloader.models import TorrentEntry
+from rutracker_downloader.offline import (
+    import_downloads,
+    plan_downloads,
+    write_links,
 )
 
 EXIT_OK = 0
@@ -52,7 +58,30 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m rutracker_downloader",
         description="Скачивает только .torrent-файлы по результатам поиска RuTracker.",
     )
-    parser.add_argument("--query", required=True, help="поисковый запрос")
+    parser.add_argument("--query", help="поисковый запрос (не нужен с --from-html)")
+    parser.add_argument(
+        "--from-html",
+        type=Path,
+        nargs="+",
+        metavar="PATH",
+        help="разобрать сохранённые из браузера страницы выдачи вместо запросов "
+        "к сайту; каталоги разворачиваются в .html/.htm внутри них",
+    )
+    parser.add_argument(
+        "--import-downloads",
+        type=Path,
+        nargs="+",
+        metavar="PATH",
+        help="разложить уже скачанные браузером .torrent по схеме именования "
+        "проекта; вместе с --from-html имена получат ещё и названия раздач",
+    )
+    parser.add_argument(
+        "--links-out",
+        type=Path,
+        default=None,
+        help="куда записать ссылки на .torrent в режиме --from-html "
+        "(по умолчанию <output>/links.txt)",
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("./output"), help="каталог для .torrent"
     )
@@ -138,9 +167,55 @@ async def _run(settings: Settings, args: argparse.Namespace, stats: Stats) -> in
     return EXIT_PARTIAL if stats.errors else EXIT_OK
 
 
+def run_offline(args: argparse.Namespace) -> int:
+    """Офлайн-ветка: сеть не нужна, поэтому не нужны ни cookies, ни User-Agent."""
+    stats = Stats()
+    base_url = (args.base_url or DEFAULT_BASE_URL).rstrip("/")
+
+    planned: list[TorrentEntry] = []
+    if args.from_html:
+        planned = plan_downloads(
+            args.from_html,
+            search_url=f"{base_url}/forum/tracker.php",
+            include_unknown=args.include_unknown,
+            stats=stats,
+        )
+
+    if args.import_downloads:
+        # Названия берём из разобранных страниц; без них имена выйдут
+        # из одного topic_id, что всё равно лучше обрезанных браузерных.
+        titles = {entry.topic_id: entry.title for entry in planned}
+        import_downloads(args.import_downloads, titles, args.output, stats)
+    elif args.dry_run:
+        for entry in planned:
+            print(
+                f"  [dry-run] {entry.topic_id}  {entry.title}  <- {entry.download_url}"
+            )
+    else:
+        target = args.links_out or args.output / "links.txt"
+        write_links(planned, target)
+        print(f"\nссылок записано: {len(planned)} -> {target}")
+
+    print_report(stats, include_unknown=args.include_unknown)
+    return EXIT_PARTIAL if stats.errors else EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     setup_logging(args.verbose)
+
+    if args.from_html or args.import_downloads:
+        try:
+            return run_offline(args)
+        except OSError as exc:
+            print(f"\nошибка файловой системы: {exc}", file=sys.stderr)
+            return EXIT_IO
+
+    if not args.query:
+        parser.error(
+            "нужен --query (или --from-html / --import-downloads для офлайн-режима)"
+        )
 
     try:
         settings = load_settings(base_url=args.base_url, cookies_file=args.cookies)
