@@ -14,6 +14,10 @@ repos:
       - id: check-toml
       - id: check-added-large-files
       - id: check-merge-conflict
+      # Прямой коммит в main запрещён: правки идут веткой и PR. Это тот же
+      # запрет, что и branch protection на GitHub, но срабатывает до пуша,
+      # когда откатить ещё дёшево.
+      - id: no-commit-to-branch
       # Утечка учётных данных уже была близка: .env.example лежал с реальными
       # логином и паролем. Проверяем, что приватные ключи не уезжают в историю.
       - id: detect-private-key
