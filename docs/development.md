@@ -7,6 +7,7 @@ uv run pytest -q
 uv run ruff check .
 uv run ruff format .
 uv run mypy
+node --test tests/test_browser_fetch.cjs
 ```
 
 ## Структура
@@ -36,6 +37,8 @@ SearchClient`, а не конкретный клиент, поэтому орк�
 тестов используют стабы. Тест CurlTransport поднимает временный HTTP-сервер
 на loopback и проверяет реальный curl, cookies, сжатие и отключение proxy.
 Для него нужны разрешённые локальные сокеты. Обращений к RuTracker в тестах нет.
+Node.js-тест запускает браузерный сниппет с подставными DOM/fetch и таймерами:
+он проверяет отложенный отзыв blob-URL, но не заменяет прогон в Firefox.
 
 Покрыто в том числе: детект Cloudflare-challenge без ретраев, HTML вместо
 торрента при протухшей сессии, `Retry-After` в формате HTTP-date, приоритет

@@ -48,7 +48,8 @@
     link.href = URL.createObjectURL(new Blob([bytes], { type }));
     link.download = filename;
     link.click();
-    URL.revokeObjectURL(link.href);
+    const objectUrl = link.href;
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
   };
 
   const decoder = new TextDecoder("windows-1251");

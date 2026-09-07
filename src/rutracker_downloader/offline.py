@@ -1,8 +1,7 @@
 """Офлайн-режим: разбор сохранённых из браузера страниц выдачи.
 
-Cloudflare не пропускает HTTP-клиент, но браузер пользователя работает
-(root cause: отличается TLS-отпечаток, а не cookies или User-Agent). Поэтому
-страницы выдачи сохраняются вручную, а утилита берёт на себя всё остальное:
+Если сетевой клиент не получает выдачу, страницы сохраняются браузером,
+а утилита берёт на себя всё остальное:
 разбор, фильтрацию, дедупликацию и список ссылок на .torrent для качалки.
 
 Модуль читает только локальные файлы: сети здесь нет.
@@ -69,6 +68,7 @@ def plan_downloads(
     search_url: str,
     include_unknown: bool,
     stats: Stats,
+    require_download_link: bool = True,
 ) -> list[TorrentEntry]:
     """Разобрать сохранённые страницы и отобрать раздачи к скачиванию.
 
@@ -97,7 +97,8 @@ def plan_downloads(
         if entry.download_url is None:
             stats.missing_link += 1
             logger.warning("нет ссылки на .torrent: %s", entry.title)
-            continue
+            if require_download_link:
+                continue
         planned.append(entry)
     return planned
 
@@ -106,7 +107,7 @@ def write_links(entries: Sequence[TorrentEntry], target: Path) -> None:
     """Записать ссылки по одной в строке — формат, понятный любой качалке."""
     target.parent.mkdir(parents=True, exist_ok=True)
     lines = [entry.download_url for entry in entries if entry.download_url]
-    target.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+    target.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
 
 
 TORRENT_SUFFIX: Final = ".torrent"
@@ -136,6 +137,7 @@ def import_downloads(
     stats: Stats,
     *,
     allowed: Container[int] | None = None,
+    dry_run: bool = False,
 ) -> None:
     """Разложить скачанные браузером .torrent по схеме именования проекта.
 
@@ -148,7 +150,8 @@ def import_downloads(
     значило бы завести вторую копию правил, которая разойдётся с filters.py.
     None означает «разложить всё» — режим импорта без разбора страниц.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     for path in collect_torrent_files(sources):
         payload = path.read_bytes()
@@ -161,10 +164,14 @@ def import_downloads(
             )
             continue
 
-        topic_id = topic_id_from_torrent(payload)
-        if topic_id is None:
+        try:
+            topic_id = topic_id_from_torrent(payload, strict=True)
+        except ValueError:
             stats.errors += 1
-            logger.warning("в файле нет ссылки на тему, пропущен: %s", path.name)
+            logger.warning("повреждённый .torrent, пропущен: %s", path.name)
+            continue
+        if topic_id is None:
+            logger.info("в файле нет ссылки на тему, пропущен: %s", path.name)
             continue
 
         if allowed is not None and topic_id not in allowed:
@@ -174,6 +181,9 @@ def import_downloads(
             continue
 
         filename = torrent_filename(topic_id, titles.get(topic_id, ""))
+        if dry_run:
+            print(f"  [dry-run] {path.name} -> {filename}")
+            continue
         if save_payload(output_dir, filename, payload, prefix=f".{topic_id}-"):
             stats.downloaded += 1
         else:

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from rutracker_downloader.client import DEFAULT_DELAY, RutrackerClient
-from rutracker_downloader.config import DEFAULT_BASE_URL, Settings, load_settings
+from rutracker_downloader.config import Settings, load_settings
 from rutracker_downloader.downloader import (
     DEFAULT_CONCURRENCY,
     DEFAULT_MAX_PAGES,
@@ -189,15 +189,16 @@ async def _run(settings: Settings, args: argparse.Namespace, stats: Stats) -> in
 def run_offline(args: argparse.Namespace) -> int:
     """Офлайн-ветка: сеть не нужна, поэтому не нужны ни cookies, ни User-Agent."""
     stats = Stats()
-    base_url = (args.base_url or DEFAULT_BASE_URL).rstrip("/")
+    settings = load_settings(base_url=args.base_url, require_user_agent=False)
 
     planned: list[TorrentEntry] = []
     if args.from_html:
         planned = plan_downloads(
             args.from_html,
-            search_url=f"{base_url}/forum/tracker.php",
+            search_url=settings.search_url,
             include_unknown=args.include_unknown,
             stats=stats,
+            require_download_link=not bool(args.import_downloads),
         )
 
     if args.import_downloads:
@@ -208,7 +209,12 @@ def run_offline(args: argparse.Namespace) -> int:
         # страниц импорт ограничивается тем, что прошло фильтр.
         allowed = set(titles) if args.from_html else None
         import_downloads(
-            args.import_downloads, titles, args.output, stats, allowed=allowed
+            args.import_downloads,
+            titles,
+            args.output,
+            stats,
+            allowed=allowed,
+            dry_run=args.dry_run,
         )
     elif args.dry_run:
         for entry in planned:
@@ -228,6 +234,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
+
+    if args.links_out and (args.import_downloads or not args.from_html):
+        parser.error("--links-out требует --from-html без --import-downloads")
 
     if args.flaresolverr is not None and not args.flaresolverr.strip():
         parser.error("--flaresolverr URL не может быть пустым")

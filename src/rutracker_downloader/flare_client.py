@@ -5,7 +5,7 @@ from __future__ import annotations
 import http.cookiejar
 import logging
 import re
-from typing import Self
+from typing import Final, Self
 from urllib.parse import urlsplit
 
 import httpx
@@ -23,8 +23,8 @@ from rutracker_downloader.errors import (
 )
 
 logger = logging.getLogger(__name__)
-FORWARDED_HEADERS = frozenset({"cookie", "referer", "user-agent"})
-REQUEST_TIMEOUT = 30
+FORWARDED_HEADERS: Final = frozenset({"cookie", "referer", "user-agent"})
+REQUEST_TIMEOUT: Final = 30
 
 
 class CurlTransport(httpx.AsyncBaseTransport):
@@ -50,15 +50,13 @@ class CurlTransport(httpx.AsyncBaseTransport):
         from curl_cffi import CurlError
 
         if request.method != "GET":
-            raise httpx.RequestError(
-                "FlareSolverr mode supports GET only", request=request
-            )
+            raise HttpError("FlareSolverr mode supports GET only")
         if (request.url.scheme, request.url.host, request.url.port) != (
             self._origin.scheme,
             self._origin.host,
             self._origin.port,
         ):
-            raise httpx.RequestError("Cross-origin request refused", request=request)
+            raise HttpError("Cross-origin request refused")
         try:
             response = await self._session.request(
                 "GET",
@@ -81,7 +79,9 @@ class CurlTransport(httpx.AsyncBaseTransport):
         headers = [
             (k, v)
             for k, v in response.headers.multi_items()
-            if v is not None and k.lower() not in {"content-encoding", "content-length"}
+            if v is not None
+            and k.lower()
+            not in {"content-encoding", "content-length", "transfer-encoding"}
         ]
         return httpx.Response(
             response.status_code, headers=headers, content=response.content
@@ -192,9 +192,12 @@ class FlareClient(RutrackerClient):
             ) from exc
         except ValueError as exc:
             raise HttpError("FlareSolverr вернул некорректный JSON") from exc
-        if not isinstance(data, dict) or data.get("status") != "ok":
+        if not isinstance(data, dict):
+            raise HttpError("FlareSolverr вернул некорректный формат ответа")
+        if data.get("status") != "ok":
             raise CloudflareChallenge(
-                "FlareSolverr не получил сессию за отведённое время"
+                "FlareSolverr не получил сессию; возможны ошибка браузера, "
+                "соединения или незавершённая проверка"
             )
         solution = data.get("solution")
         if not isinstance(solution, dict) or solution.get("status") != 200:
@@ -222,10 +225,13 @@ class FlareClient(RutrackerClient):
             name, value, domain, path = (
                 cookie.get(k) for k in ("name", "value", "domain", "path")
             )
-            if not all(isinstance(v, str) for v in (name, value, domain, path)):
+            if (
+                not isinstance(name, str)
+                or not isinstance(value, str)
+                or not isinstance(domain, str)
+                or not isinstance(path, str)
+            ):
                 raise HttpError("FlareSolverr: неверные поля cookie")
-            assert isinstance(name, str) and isinstance(value, str)
-            assert isinstance(domain, str) and isinstance(path, str)
             if domain.lstrip(".") == hostname:
                 secure = cookie.get("secure", True)
                 if not isinstance(secure, bool):

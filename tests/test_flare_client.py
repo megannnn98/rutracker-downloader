@@ -129,7 +129,7 @@ async def test_bootstrap_then_pages_and_binary_download(
         ({"status": "error", "message": "secret must not leak"}, CloudflareChallenge),
         ({"status": "ok", "solution": {"status": 403}}, CloudflareChallenge),
         ({"status": "ok", "solution": {"status": 200}}, HttpError),
-        ([], CloudflareChallenge),
+        ([], HttpError),
     ],
 )
 async def test_bootstrap_failure_closes_transport(
@@ -199,8 +199,13 @@ async def test_external_redirect_is_refused(
 ) -> None:
     solver_stub(monkeypatch, solution())
     async with make_client(settings) as client:
-        with pytest.raises(httpx.RequestError, match="Cross-origin"):
-            await client._client.get("https://example.org/tracker.php")
+        sleep = AsyncMock()
+        monkeypatch.setattr("rutracker_downloader.client.asyncio.sleep", sleep)
+        with pytest.raises(HttpError, match="Cross-origin"):
+            await client.request("GET", "https://example.org/tracker.php")
+        with pytest.raises(HttpError, match="GET only"):
+            await client.request("POST", "https://rutracker.net")
+        sleep.assert_not_awaited()
 
 
 def test_cli_flag_and_conflicts() -> None:
@@ -255,7 +260,7 @@ async def test_curl_errors_are_sanitized(monkeypatch: pytest.MonkeyPatch) -> Non
             with pytest.raises(httpx.RequestError) as caught:
                 await client.get("https://rutracker.net")
             assert "secret" not in str(caught.value)
-        with pytest.raises(httpx.RequestError, match="GET only"):
+        with pytest.raises(HttpError, match="GET only"):
             await client.post("https://rutracker.net")
 
 
@@ -272,10 +277,10 @@ async def test_curl_real_local_http_path(monkeypatch: pytest.MonkeyPatch) -> Non
             )
             self.send_response(200)
             self.send_header("Content-Encoding", "gzip")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Transfer-Encoding", "chunked")
             self.send_header("Set-Cookie", "rotated=new-value; Path=/")
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n")
 
         def log_message(self, format: str, *args: object) -> None:
             pass
@@ -302,6 +307,7 @@ async def test_curl_real_local_http_path(monkeypatch: pytest.MonkeyPatch) -> Non
             response = await client.get(url)
             assert response.content == b"decoded content"
             assert "content-encoding" not in response.headers
+            assert "transfer-encoding" not in response.headers
             assert response.headers["content-length"] == str(len(response.content))
             await client.get(url)
             assert "rotated=new-value" in seen[1]["cookie"]
