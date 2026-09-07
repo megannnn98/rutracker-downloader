@@ -18,7 +18,7 @@ DEFAULT_COOKIES_FILE = Path("./cookies.txt")
 class Settings:
     """Настройки запуска.
 
-    user_agent обязателен и должен совпадать с браузером, из которого
+    В обычном HTTP-режиме user_agent обязателен и должен совпадать с браузером, из которого
     экспортированы cookies: Cloudflare привязывает cf_clearance к паре
     IP + User-Agent, и при несовпадении вернётся challenge.
     """
@@ -48,12 +48,13 @@ def load_settings(
     *,
     base_url: str | None = None,
     cookies_file: Path | None = None,
+    require_user_agent: bool = True,
 ) -> Settings:
     """Собрать настройки; аргументы CLI имеют приоритет над окружением."""
     load_dotenv()
 
     user_agent = os.environ.get("RUTRACKER_USER_AGENT", "").strip()
-    if not user_agent:
+    if require_user_agent and not user_agent:
         raise ConfigError(
             "не задан RUTRACKER_USER_AGENT. Укажите в .env строку User-Agent того "
             "браузера, из которого экспортированы cookies "

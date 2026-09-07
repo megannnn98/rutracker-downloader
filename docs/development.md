@@ -2,6 +2,7 @@
 
 ```bash
 uv sync
+uv sync --extra flaresolverr  # также установить опциональный транспорт и запускать его тесты
 uv run pytest -q
 uv run ruff check .
 uv run ruff format .
@@ -14,7 +15,8 @@ uv run mypy
 src/rutracker_downloader/
 ├── cli.py         # argparse, коды возврата, печать статистики
 ├── config.py      # Settings из .env
-├── client.py      # единственный слой с сетью
+├── client.py      # HTTP, повторы, задержки и cookies обычного режима
+├── flare_client.py # опциональный FlareSolverr и curl_cffi транспорт
 ├── parser.py      # HTML → модели (чистый)
 ├── filters.py     # классификация audio/ebook/unknown (чистый)
 ├── naming.py      # безопасные имена файлов (чистый)

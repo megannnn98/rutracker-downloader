@@ -9,7 +9,7 @@ $EDITOR .env
 
 | Переменная | Обязательна | Назначение |
 |---|---|---|
-| `RUTRACKER_USER_AGENT` | да | User-Agent браузера, из которого взяты cookies (Firefox: `about:support` → «Строка агента пользователя») |
+| `RUTRACKER_USER_AGENT` | только обычный HTTP-режим | User-Agent браузера, из которого взяты cookies; с `--flaresolverr` определяется автоматически |
 | `RUTRACKER_COOKIES` | нет | путь к Netscape-файлу, по умолчанию `./cookies.txt` |
 | `RUTRACKER_BASE_URL` | нет | зеркало, по умолчанию `https://rutracker.net` |
 | `RUTRACKER_USERNAME` | нет | только для `--login` (fallback, если challenge снимут) |
@@ -33,6 +33,7 @@ $EDITOR .env
 | `--concurrency` | одновременных запросов (обход выдачи и скачивание), по умолчанию 20; не меньше 1 |
 | `--include-unknown` | качать и раздачи без книжных и аудио-маркеров |
 | `--base-url` | другое зеркало |
+| `--flaresolverr [URL]` | сессия через локальный FlareSolverr; URL по умолчанию `http://127.0.0.1:8191` |
 | `--cookies` | путь к файлу cookies |
 | `--login` | логин по паролю вместо cookies (сейчас упирается в challenge) |
 
@@ -55,6 +56,39 @@ $EDITOR .env
 
 При аварийной остановке статистика за уже пройденную часть прогона всё равно
 печатается.
+
+## FlareSolverr
+
+```bash
+docker compose up -d
+uv run --extra flaresolverr python -m rutracker_downloader \
+    --flaresolverr --query "кант" --output ./torrents/kant \
+    --delay 1 --concurrency 2
+```
+
+Нужны Docker Compose и Netscape-файл cookies с действующим
+`bb_session`. `--cookies` и `RUTRACKER_COOKIES` задают именно исходный файл:
+в этом режиме кэш обычного HTTP-клиента не используется. Значение User-Agent
+для сетевых запросов берётся из ответа FlareSolverr; задавать
+`RUTRACKER_USER_AGENT` в `.env` для этого режима не требуется.
+
+При каждом запуске FlareSolverr получает первую страницу и новую сессию,
+используя браузер в фоне. Далее запросы выполняет `curl_cffi` с профилем
+`chrome146`. Сессия хранится только в памяти. Cookies других доменов не
+передаются сервису. Допускаются только локальные URL сервиса без пути;
+`--base-url` должен использовать HTTPS. Перенаправления на другой origin
+отклоняются.
+
+На получение сессии отводится 60 секунд; недоступность сервиса, некорректный
+ответ и challenge дают код `2`. Если challenge появляется позднее, прогон
+завершается после текущей группы задач: повторный запуск получает новую
+сессию и пропускает уже сохранённые файлы. Автоматического обновления сессии
+посреди прогона нет. `--login` и офлайн-флаги несовместимы с `--flaresolverr`.
+
+При другом локальном порте: `--flaresolverr http://127.0.0.1:18191`.
+Остановка: `docker compose down`. После обновления браузера FlareSolverr
+совместимость профиля curl необходимо перепроверить; Compose закрепляет
+проверенный образ по digest.
 
 ## Пример вывода dry-run
 

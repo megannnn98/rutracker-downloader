@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from typing import Self
 
@@ -78,6 +79,29 @@ def test_zero_delay_is_allowed() -> None:
     from rutracker_downloader.cli import build_parser
 
     assert build_parser().parse_args(["--query", "лем", "--delay", "0"]).delay == 0.0
+
+
+@pytest.mark.parametrize("user_agent", [None, "   "])
+@pytest.mark.parametrize("flaresolverr", [False, True])
+def test_user_agent_required_only_for_plain_http(
+    monkeypatch: pytest.MonkeyPatch, user_agent: str | None, flaresolverr: bool
+) -> None:
+    monkeypatch.setattr("rutracker_downloader.config.load_dotenv", lambda: None)
+    monkeypatch.delenv("RUTRACKER_USER_AGENT", raising=False)
+    if user_agent is not None:
+        monkeypatch.setenv("RUTRACKER_USER_AGENT", user_agent)
+    received: list[Settings] = []
+
+    async def run(settings: Settings, args: argparse.Namespace, stats: Stats) -> int:
+        received.append(settings)
+        return EXIT_OK
+
+    monkeypatch.setattr("rutracker_downloader.cli._run", run)
+    argv = ["--query", "кант"] + (["--flaresolverr"] if flaresolverr else [])
+    assert main(argv) == (EXIT_OK if flaresolverr else EXIT_CONFIG)
+    assert len(received) == int(flaresolverr)
+    if received:
+        assert received[0].user_agent == ""
 
 
 def test_default_delay_and_concurrency() -> None:

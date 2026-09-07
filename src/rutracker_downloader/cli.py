@@ -114,6 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-url", default=None, help="зеркало RuTracker")
     parser.add_argument(
+        "--flaresolverr",
+        nargs="?",
+        const="http://127.0.0.1:8191",
+        metavar="URL",
+        help="получить сессию через локальный FlareSolverr и использовать curl_cffi",
+    )
+    parser.add_argument(
         "--cookies", type=Path, default=None, help="Netscape-файл с cookies"
     )
     parser.add_argument(
@@ -143,7 +150,15 @@ def print_report(stats: Stats, *, include_unknown: bool) -> None:
 
 
 async def _run(settings: Settings, args: argparse.Namespace, stats: Stats) -> int:
-    async with RutrackerClient(settings, delay=args.delay) as client:
+    if args.flaresolverr:
+        from rutracker_downloader.flare_client import FlareClient
+
+        selected_client: RutrackerClient = FlareClient(
+            settings, query=args.query, solver_url=args.flaresolverr, delay=args.delay
+        )
+    else:
+        selected_client = RutrackerClient(settings, delay=args.delay)
+    async with selected_client as client:
         if args.login:
             if not settings.username or not settings.password:
                 print(
@@ -210,6 +225,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
 
+    if args.flaresolverr and (args.login or args.from_html or args.import_downloads):
+        parser.error("--flaresolverr несовместим с --login и офлайн-режимами")
+
     if args.from_html or args.import_downloads:
         try:
             return run_offline(args)
@@ -223,7 +241,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
-        settings = load_settings(base_url=args.base_url, cookies_file=args.cookies)
+        settings = load_settings(
+            base_url=args.base_url,
+            cookies_file=args.cookies,
+            require_user_agent=not bool(args.flaresolverr),
+        )
     except ConfigError as exc:
         print(f"ошибка конфигурации: {exc}", file=sys.stderr)
         return EXIT_CONFIG
