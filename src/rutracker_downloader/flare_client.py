@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.cookiejar
 import logging
+import re
 from typing import Self
 from urllib.parse import urlsplit
 
@@ -22,24 +23,31 @@ from rutracker_downloader.errors import (
 )
 
 logger = logging.getLogger(__name__)
-DEFAULT_SOLVER_URL = "http://127.0.0.1:8191"
+FORWARDED_HEADERS = frozenset({"cookie", "referer", "user-agent"})
+REQUEST_TIMEOUT = 30
 
 
 class CurlTransport(httpx.AsyncBaseTransport):
     """Keep HTTPX cookie/redirect handling and the existing retry policy."""
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, *, concurrency: int = 20) -> None:
         try:
+            from curl_cffi import CurlOpt
             from curl_cffi.requests import AsyncSession
         except ImportError as exc:
             raise ConfigError(
                 "Для --flaresolverr выполните uv sync --extra flaresolverr"
             ) from exc
         self._origin = httpx.URL(base_url)
-        self._session = AsyncSession(impersonate="chrome146", discard_cookies=True)
+        self._session = AsyncSession(
+            impersonate="chrome146",
+            discard_cookies=True,
+            max_clients=concurrency,
+            curl_options={CurlOpt.PROXY: ""},
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        from curl_cffi.requests import RequestsError
+        from curl_cffi import CurlError
 
         if request.method != "GET":
             raise httpx.RequestError(
@@ -55,16 +63,21 @@ class CurlTransport(httpx.AsyncBaseTransport):
             response = await self._session.request(
                 "GET",
                 str(request.url),
-                headers=list(request.headers.multi_items()),
+                headers=[
+                    (k, v)
+                    for k, v in request.headers.multi_items()
+                    if k.lower() in FORWARDED_HEADERS
+                ],
                 data=await request.aread(),
                 allow_redirects=False,
-                timeout=30,
+                timeout=REQUEST_TIMEOUT,
             )
-        except RequestsError as exc:
+        except CurlError as exc:
             # Exceptions from transports may contain request details; log no cookies.
             raise httpx.RequestError(
                 f"curl_cffi: {type(exc).__name__}", request=request
             ) from exc
+        # libcurl already decoded the body; decoding failures raise CurlError.
         headers = [
             (k, v)
             for k, v in response.headers.multi_items()
@@ -75,14 +88,25 @@ class CurlTransport(httpx.AsyncBaseTransport):
         )
 
     async def aclose(self) -> None:
-        await self._session.close()
+        from curl_cffi import CurlError
+
+        try:
+            await self._session.close()
+        except CurlError as exc:
+            raise HttpError("curl_cffi: не удалось закрыть транспорт") from exc
 
 
 class FlareClient(RutrackerClient):
     """Obtain fresh clearance once per run; never overwrite Firefox cookies."""
 
     def __init__(
-        self, settings: Settings, *, query: str, solver_url: str, delay: float
+        self,
+        settings: Settings,
+        *,
+        query: str,
+        solver_url: str,
+        delay: float,
+        concurrency: int = 20,
     ) -> None:
         endpoint = urlsplit(solver_url)
         if (
@@ -129,7 +153,9 @@ class FlareClient(RutrackerClient):
             if c.name != "cf_clearance" and c.domain.lstrip(".") == origin.hostname
         ]
         client = httpx.AsyncClient(
-            transport=CurlTransport(settings.base_url), follow_redirects=True
+            transport=CurlTransport(settings.base_url, concurrency=concurrency),
+            follow_redirects=True,
+            timeout=None,
         )
         super().__init__(settings, delay=delay, client=client)
         self._owns_client = True
@@ -201,8 +227,37 @@ class FlareClient(RutrackerClient):
             assert isinstance(name, str) and isinstance(value, str)
             assert isinstance(domain, str) and isinstance(path, str)
             if domain.lstrip(".") == hostname:
-                self._client.cookies.set(name, value, domain=domain, path=path)
+                secure = cookie.get("secure", True)
+                if not isinstance(secure, bool):
+                    raise HttpError("FlareSolverr: неверное поле secure cookie")
+                self._client.cookies.jar.set_cookie(
+                    http.cookiejar.Cookie(
+                        version=0,
+                        name=name,
+                        value=value,
+                        port=None,
+                        port_specified=False,
+                        domain=domain,
+                        domain_specified=True,
+                        domain_initial_dot=domain.startswith("."),
+                        path=path,
+                        path_specified=True,
+                        secure=secure,
+                        expires=None,
+                        discard=True,
+                        comment=None,
+                        comment_url=None,
+                        rest={},
+                        rfc2109=False,
+                    )
+                )
         self._client.headers["User-Agent"] = ua
+        browser = re.search(r"Chrome/(\d+)", ua)
+        if "Macintosh" not in ua or browser is None or browser.group(1) != "146":
+            logger.warning(
+                "FlareSolverr: браузер отличается от профиля curl chrome146/macOS; "
+                "совместимость сессии не гарантирована"
+            )
         self._initial_html = html
         self._seed_cookies = []
         logger.info("FlareSolverr: сессия получена, дальнейшие запросы через curl_cffi")

@@ -6,3 +6,15 @@ services:
     environment:
       LOG_LEVEL: warning
     restart: unless-stopped
+    mem_limit: 2g
+    pids_limit: 512
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8191/', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

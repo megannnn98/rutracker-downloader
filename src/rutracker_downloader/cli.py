@@ -150,11 +150,15 @@ def print_report(stats: Stats, *, include_unknown: bool) -> None:
 
 
 async def _run(settings: Settings, args: argparse.Namespace, stats: Stats) -> int:
-    if args.flaresolverr:
+    if args.flaresolverr is not None:
         from rutracker_downloader.flare_client import FlareClient
 
         selected_client: RutrackerClient = FlareClient(
-            settings, query=args.query, solver_url=args.flaresolverr, delay=args.delay
+            settings,
+            query=args.query,
+            solver_url=args.flaresolverr,
+            delay=args.delay,
+            concurrency=args.concurrency,
         )
     else:
         selected_client = RutrackerClient(settings, delay=args.delay)
@@ -225,7 +229,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
 
-    if args.flaresolverr and (args.login or args.from_html or args.import_downloads):
+    if args.flaresolverr is not None and not args.flaresolverr.strip():
+        parser.error("--flaresolverr URL не может быть пустым")
+    if args.flaresolverr is not None and (
+        args.login or args.from_html or args.import_downloads
+    ):
         parser.error("--flaresolverr несовместим с --login и офлайн-режимами")
 
     if args.from_html or args.import_downloads:
@@ -244,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         settings = load_settings(
             base_url=args.base_url,
             cookies_file=args.cookies,
-            require_user_agent=not bool(args.flaresolverr),
+            require_user_agent=args.flaresolverr is None,
         )
     except ConfigError as exc:
         print(f"ошибка конфигурации: {exc}", file=sys.stderr)
