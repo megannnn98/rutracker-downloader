@@ -23,6 +23,12 @@ from rutracker_downloader.errors import (
     RutrackerError,
     SessionExpired,
 )
+from rutracker_downloader.models import TorrentEntry
+from rutracker_downloader.offline import (
+    import_downloads,
+    plan_downloads,
+    write_links,
+)
 
 EXIT_OK = 0
 EXIT_CONFIG = 1
@@ -52,7 +58,30 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m rutracker_downloader",
         description="Скачивает только .torrent-файлы по результатам поиска RuTracker.",
     )
-    parser.add_argument("--query", required=True, help="поисковый запрос")
+    parser.add_argument("--query", help="поисковый запрос (не нужен с --from-html)")
+    parser.add_argument(
+        "--from-html",
+        type=Path,
+        nargs="+",
+        metavar="PATH",
+        help="разобрать сохранённые из браузера страницы выдачи вместо запросов "
+        "к сайту; каталоги разворачиваются в .html/.htm внутри них",
+    )
+    parser.add_argument(
+        "--import-downloads",
+        type=Path,
+        nargs="+",
+        metavar="PATH",
+        help="разложить уже скачанные браузером .torrent по схеме именования "
+        "проекта; вместе с --from-html имена получат ещё и названия раздач",
+    )
+    parser.add_argument(
+        "--links-out",
+        type=Path,
+        default=None,
+        help="куда записать ссылки на .torrent в режиме --from-html "
+        "(по умолчанию <output>/links.txt)",
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("./output"), help="каталог для .torrent"
     )
@@ -85,6 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-url", default=None, help="зеркало RuTracker")
     parser.add_argument(
+        "--flaresolverr",
+        nargs="?",
+        const="http://127.0.0.1:8191",
+        metavar="URL",
+        help="получить сессию через локальный FlareSolverr и использовать curl_cffi",
+    )
+    parser.add_argument(
         "--cookies", type=Path, default=None, help="Netscape-файл с cookies"
     )
     parser.add_argument(
@@ -114,7 +150,19 @@ def print_report(stats: Stats, *, include_unknown: bool) -> None:
 
 
 async def _run(settings: Settings, args: argparse.Namespace, stats: Stats) -> int:
-    async with RutrackerClient(settings, delay=args.delay) as client:
+    if args.flaresolverr is not None:
+        from rutracker_downloader.flare_client import FlareClient
+
+        selected_client: RutrackerClient = FlareClient(
+            settings,
+            query=args.query,
+            solver_url=args.flaresolverr,
+            delay=args.delay,
+            concurrency=args.concurrency,
+        )
+    else:
+        selected_client = RutrackerClient(settings, delay=args.delay)
+    async with selected_client as client:
         if args.login:
             if not settings.username or not settings.password:
                 print(
@@ -138,12 +186,83 @@ async def _run(settings: Settings, args: argparse.Namespace, stats: Stats) -> in
     return EXIT_PARTIAL if stats.errors else EXIT_OK
 
 
+def run_offline(args: argparse.Namespace) -> int:
+    """Офлайн-ветка: сеть не нужна, поэтому не нужны ни cookies, ни User-Agent."""
+    stats = Stats()
+    settings = load_settings(base_url=args.base_url, require_user_agent=False)
+
+    planned: list[TorrentEntry] = []
+    if args.from_html:
+        planned = plan_downloads(
+            args.from_html,
+            search_url=settings.search_url,
+            include_unknown=args.include_unknown,
+            stats=stats,
+            require_download_link=not bool(args.import_downloads),
+        )
+
+    if args.import_downloads:
+        # Названия берём из разобранных страниц; без них имена выйдут
+        # из одного topic_id, что всё равно лучше обрезанных браузерных.
+        titles = {entry.topic_id: entry.title for entry in planned}
+        # Браузерный сниппет качает выдачу целиком, поэтому при разборе
+        # страниц импорт ограничивается тем, что прошло фильтр.
+        allowed = set(titles) if args.from_html else None
+        import_downloads(
+            args.import_downloads,
+            titles,
+            args.output,
+            stats,
+            allowed=allowed,
+            dry_run=args.dry_run,
+        )
+    elif args.dry_run:
+        for entry in planned:
+            print(
+                f"  [dry-run] {entry.topic_id}  {entry.title}  <- {entry.download_url}"
+            )
+    else:
+        target = args.links_out or args.output / "links.txt"
+        write_links(planned, target)
+        print(f"\nссылок записано: {len(planned)} -> {target}")
+
+    print_report(stats, include_unknown=args.include_unknown)
+    return EXIT_PARTIAL if stats.errors else EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     setup_logging(args.verbose)
 
+    if args.links_out and (args.import_downloads or not args.from_html):
+        parser.error("--links-out требует --from-html без --import-downloads")
+
+    if args.flaresolverr is not None and not args.flaresolverr.strip():
+        parser.error("--flaresolverr URL не может быть пустым")
+    if args.flaresolverr is not None and (
+        args.login or args.from_html or args.import_downloads
+    ):
+        parser.error("--flaresolverr несовместим с --login и офлайн-режимами")
+
+    if args.from_html or args.import_downloads:
+        try:
+            return run_offline(args)
+        except OSError as exc:
+            print(f"\nошибка файловой системы: {exc}", file=sys.stderr)
+            return EXIT_IO
+
+    if not args.query:
+        parser.error(
+            "нужен --query (или --from-html / --import-downloads для офлайн-режима)"
+        )
+
     try:
-        settings = load_settings(base_url=args.base_url, cookies_file=args.cookies)
+        settings = load_settings(
+            base_url=args.base_url,
+            cookies_file=args.cookies,
+            require_user_agent=args.flaresolverr is None,
+        )
     except ConfigError as exc:
         print(f"ошибка конфигурации: {exc}", file=sys.stderr)
         return EXIT_CONFIG

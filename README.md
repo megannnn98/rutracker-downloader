@@ -46,6 +46,30 @@ $EDITOR .env      # RUTRACKER_USER_AGENT=...
 
 ## Запуск
 
+### Через FlareSolverr
+
+Если обычный HTTP-клиент получает Cloudflare 403, можно использовать локальный
+FlareSolverr и `curl_cffi`. Ручной обход страниц в браузере не требуется;
+для входа на форум пока нужен экспортированный `cookies.txt` с `bb_session`.
+User-Agent определяется автоматически; `RUTRACKER_USER_AGENT` не требуется.
+
+```bash
+docker compose up -d
+uv run --extra flaresolverr python -m rutracker_downloader \
+    --flaresolverr --query "кант" --output ./torrents/kant \
+    --delay 1 --concurrency 2
+```
+
+Сервис доступен только на `127.0.0.1:8191`. Первая выдача и новая сессия
+получаются через FlareSolverr; остальные страницы и `.torrent` запрашиваются
+через `curl_cffi`. Исходные cookies и кэш обычного клиента не перезаписываются.
+Остановка сервиса: `docker compose down`.
+
+При протухшем `bb_session` нужен новый экспорт. Автономный вход по паролю
+в этом режиме не поддерживается. Подробности: [справочник CLI](docs/cli.md#flaresolverr).
+
+### Обычный HTTP-клиент
+
 ```bash
 uv run python -m rutracker_downloader --query "станислав лем"
 ```

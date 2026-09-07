@@ -2,10 +2,12 @@
 
 ```bash
 uv sync
+uv sync --extra flaresolverr  # также установить опциональный транспорт и запускать его тесты
 uv run pytest -q
 uv run ruff check .
 uv run ruff format .
 uv run mypy
+node --test tests/test_browser_fetch.cjs
 ```
 
 ## Структура
@@ -14,7 +16,8 @@ uv run mypy
 src/rutracker_downloader/
 ├── cli.py         # argparse, коды возврата, печать статистики
 ├── config.py      # Settings из .env
-├── client.py      # единственный слой с сетью
+├── client.py      # HTTP, повторы, задержки и cookies обычного режима
+├── flare_client.py # опциональный FlareSolverr и curl_cffi транспорт
 ├── parser.py      # HTML → модели (чистый)
 ├── filters.py     # классификация audio/ebook/unknown (чистый)
 ├── naming.py      # безопасные имена файлов (чистый)
@@ -30,8 +33,12 @@ SearchClient`, а не конкретный клиент, поэтому орк�
 
 ## Тесты
 
-Полностью офлайн: парсер — на сохранённых HTML-фикстурах в `tests/fixtures/`,
-сетевой слой — через `httpx.MockTransport`. Обращений к RuTracker в тестах нет.
+Без внешней сети: парсер использует сохранённые фикстуры, большинство сетевых
+тестов используют стабы. Тест CurlTransport поднимает временный HTTP-сервер
+на loopback и проверяет реальный curl, cookies, сжатие и отключение proxy.
+Для него нужны разрешённые локальные сокеты. Обращений к RuTracker в тестах нет.
+Node.js-тест запускает браузерный сниппет с подставными DOM/fetch и таймерами:
+он проверяет отложенный отзыв blob-URL, но не заменяет прогон в Firefox.
 
 Покрыто в том числе: детект Cloudflare-challenge без ретраев, HTML вместо
 торрента при протухшей сессии, `Retry-After` в формате HTTP-date, приоритет
