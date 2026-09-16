@@ -188,7 +188,8 @@ class FlareClient(RutrackerClient):
                 data = response.json()
         except httpx.HTTPError as exc:
             raise HttpError(
-                "FlareSolverr недоступен: проверьте docker compose up -d"
+                "FlareSolverr недоступен: проверьте docker compose up -d, "
+                "docker ps и docker logs torrent-loader-flaresolverr-1"
             ) from exc
         except ValueError as exc:
             raise HttpError("FlareSolverr вернул некорректный JSON") from exc
@@ -197,11 +198,16 @@ class FlareClient(RutrackerClient):
         if data.get("status") != "ok":
             raise CloudflareChallenge(
                 "FlareSolverr не получил сессию; возможны ошибка браузера, "
-                "соединения или незавершённая проверка"
+                "соединения или незавершённая проверка. Повторите запуск; если "
+                "не помогает, обновите cookies.txt и смотрите "
+                "docs/cli.md#если-скачивание-не-идёт"
             )
         solution = data.get("solution")
         if not isinstance(solution, dict) or solution.get("status") != 200:
-            raise CloudflareChallenge("FlareSolverr не получил HTTP 200 от RuTracker")
+            raise CloudflareChallenge(
+                "FlareSolverr не получил HTTP 200 от RuTracker. Обновите cookies.txt, "
+                "проверьте доступ к сайту в браузере и повторите запуск"
+            )
         html, ua, cookies = (
             solution.get("response"),
             solution.get("userAgent"),
@@ -216,7 +222,8 @@ class FlareClient(RutrackerClient):
             raise HttpError("FlareSolverr: неполный ответ сессии")
         if looks_like_guest_page(html):
             raise SessionExpired(
-                "FlareSolverr: сессия RuTracker протухла; нужен свежий экспорт bb_session"
+                "FlareSolverr: сессия RuTracker протухла; нужен свежий экспорт "
+                "cookies.txt с bb_session"
             )
         hostname = urlsplit(self._settings.base_url).hostname
         for cookie in cookies:
@@ -279,5 +286,6 @@ class FlareClient(RutrackerClient):
             return await super().request(method, url, **kwargs)
         except CloudflareChallenge as exc:
             raise CloudflareChallenge(
-                "Сессия FlareSolverr больше не принимается: повторите запуск для получения новой"
+                "Сессия FlareSolverr больше не принимается: повторите запуск для "
+                "получения новой. Уже скачанные файлы будут пропущены"
             ) from exc

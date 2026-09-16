@@ -51,7 +51,9 @@ DEFAULT_DELAY: Final = 0.01  # суммарная частота = 1/delay; пр
 CHALLENGE_HELP: Final = (
     "Cloudflare вернул JS-challenge. Обновите cookies: откройте rutracker в том же "
     "браузере, пройдите проверку, заново экспортируйте cookies.txt и убедитесь, что "
-    "RUTRACKER_USER_AGENT совпадает с User-Agent этого браузера."
+    "RUTRACKER_USER_AGENT совпадает с User-Agent этого браузера. Если обычный "
+    "HTTP-режим не проходит, используйте --flaresolverr; подробный порядок "
+    "диагностики: docs/cli.md#если-скачивание-не-идёт."
 )
 
 

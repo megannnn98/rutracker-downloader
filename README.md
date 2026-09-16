@@ -66,7 +66,9 @@ uv run --extra flaresolverr python -m rutracker_downloader \
 Остановка сервиса: `docker compose down`.
 
 При протухшем `bb_session` нужен новый экспорт. Автономный вход по паролю
-в этом режиме не поддерживается. Подробности: [справочник CLI](docs/cli.md#flaresolverr).
+в этом режиме не поддерживается. Если скачивание не идёт, начните с
+[пошаговой диагностики](docs/cli.md#если-скачивание-не-идёт). Подробности:
+[справочник CLI](docs/cli.md#flaresolverr).
 
 ### Обычный HTTP-клиент
 

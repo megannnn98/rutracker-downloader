@@ -57,6 +57,83 @@ $EDITOR .env
 При аварийной остановке статистика за уже пройденную часть прогона всё равно
 печатается.
 
+## Если скачивание не идёт
+
+Сначала отделите три разных сбоя: нет доступа к сервису, сайт не принял сессию
+или файлы отсеял фильтр. Команды ниже не скачивают содержимое раздач; максимум
+получают страницы выдачи и `.torrent`-метаданные.
+
+1. Проверьте, что локальный FlareSolverr жив:
+
+```bash
+docker compose up -d
+docker ps --filter name=torrent-loader-flaresolverr --format '{{.Names}} {{.Status}} {{.Ports}}'
+curl -fsS http://127.0.0.1:8191/ >/dev/null && echo ok
+```
+
+Если `curl` не печатает `ok`, смотрите логи сервиса:
+
+```bash
+docker logs --tail 100 torrent-loader-flaresolverr-1
+```
+
+2. Проверьте cookies. Для `--flaresolverr` нужен действующий `bb_session`;
+`RUTRACKER_USER_AGENT` не нужен. Откройте RuTracker в браузере, убедитесь, что
+вы вошли в аккаунт и видите выдачу, затем переэкспортируйте cookies:
+
+```bash
+uv run python scripts/export_firefox_cookies.py
+ls -l cookies.txt
+```
+
+Если используете не `./cookies.txt`, передайте путь явно:
+
+```bash
+uv run --extra flaresolverr python -m rutracker_downloader \
+    --flaresolverr --cookies /path/to/cookies.txt \
+    --query "кропоткин" --output ./torrents/kropotkin \
+    --dry-run --delay 1 --concurrency 2
+```
+
+3. Начинайте с `--dry-run`. Так видно, проблема в доступе или в фильтре:
+
+```bash
+uv run --extra flaresolverr python -m rutracker_downloader \
+    --flaresolverr --query "кропоткин" --output ./torrents/kropotkin \
+    --dry-run --delay 1 --concurrency 2
+```
+
+Если `найдено раздач : 0`, попробуйте другой регистр или более точный запрос:
+RuTracker может различать варианты вроде `кропоткин`, `Кропоткин`,
+`Кропоткин П.А.`. Если `найдено` больше нуля, но `скачано новых : 0`, смотрите
+счётчики: `исключено как аудио`, `неопределённых пропущено`, `уже существовало`.
+Для просмотра неопределённых добавьте `--include-unknown`.
+
+4. Если dry-run работает, запускайте обычное скачивание тем же запросом:
+
+```bash
+uv run --extra flaresolverr python -m rutracker_downloader \
+    --flaresolverr --query "кропоткин" --output ./torrents/kropotkin \
+    --delay 1 --concurrency 2
+```
+
+Повторный запуск безопасен: уже сохранённые `.torrent` будут посчитаны как
+`уже существовало`, а недокачанные продолжатся.
+
+5. Значения типовых ошибок:
+
+* `FlareSolverr недоступен` — контейнер не запущен, unhealthy, занят порт или
+  локальный HTTP endpoint не отвечает. Проверьте `docker compose up -d`,
+  `docker ps`, `docker logs`.
+* `FlareSolverr не получил сессию` / `не получил HTTP 200` — локальный браузер
+  сервиса не прошёл защиту сайта. Повторите запуск, затем обновите `cookies.txt`.
+* `сессия RuTracker протухла` / `RuTracker считает нас гостем` — нужен свежий
+  экспорт cookies из уже залогиненного браузера.
+* `Сессия FlareSolverr больше не принимается` — сайт отозвал clearance посреди
+  прогона. Повторите ту же команду; уже сохранённые файлы не скачаются заново.
+* Код `3` при ненулевом `ошибок` — часть отдельных `.torrent` не скачалась,
+  но прогон дошёл до конца. Повторите команду позже.
+
 ## FlareSolverr
 
 Транспорт пересылает только Cookie, Referer и полученный от сервиса User-Agent;
